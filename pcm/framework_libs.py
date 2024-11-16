@@ -6,19 +6,19 @@ from tqdm import tqdm
 import auxiliary_libs as aux
 import model_libs as mod_libs
 
-def process_single_batch(batch, fit_opt):
+def process_single_batch(batch, fit_opt: mod_libs.fit_options, batch_index):
     """
     Process a single batch to perform DAG discovery and compute Jacobians.
 
     Parameters:
     - batch: A batch of input data.
     - fit_opt: An object containing various options and hyperparameters for the learning process.
-
+    - batch_index: The index of the current batch.
     Returns:
     - A tuple containing the learned adjacency matrix and the computed Jacobians.
     """
     model = mod_libs.pcm_unit(loss_type=fit_opt.loss_type)  # Initialize the model with the specified loss type
-    sub_W, sub_jacobians = model.fit(batch, fit_opt)  # Fit the model to the batch
+    sub_W, sub_jacobians = model.fit(batch, fit_opt, batch_index)  # Fit the model to the batch
     
     return sub_W, sub_jacobians
 
@@ -45,7 +45,7 @@ def directed_acyclic_graph_learning(X: torch.Tensor, fit_opt, ens_opt):
         futures = []
         
         with ProcessPoolExecutor(max_workers=optimal_workers) as executor:
-            for batch in batches:
+            for batch_index, batch in enumerate(batches):
                 # Check memory usage before submitting a new batch
                 if aux.check_memory_usage(threshold=ens_opt.mem_threshold):
                     print(f"Memory usage exceeded threshold with {optimal_workers} workers. Reducing to {optimal_workers - 1}.")
@@ -53,19 +53,20 @@ def directed_acyclic_graph_learning(X: torch.Tensor, fit_opt, ens_opt):
                     break  # Exit the for loop to re-evaluate worker count
 
                 # Submit the batch for processing
-                futures.append(executor.submit(process_single_batch, batch, fit_opt))
+                futures.append(executor.submit(process_single_batch, batch, fit_opt, batch_index))
 
             # Collect results from futures
             for future in tqdm(futures, desc="Collecting results"):
                 try:
                     sub_W, sub_jacobians = future.result()
                     W_est_list.append(sub_W)
-                    loss_jacobian_list.append(sub_jacobians['loss_jacobian'])
-                    score_jacobian_list.append(sub_jacobians['score_jacobian'])
-                    constraint_jacobian_list.append(sub_jacobians['constraint_jacobian'])
-                    reg_jacobian_list.append(sub_jacobians['reg_jacobian'])
+                    loss_jacobian_list.append(sub_jacobians['loss_jacobian'].detach().numpy())
+                    score_jacobian_list.append(sub_jacobians['score_jacobian'].detach().numpy())
+                    constraint_jacobian_list.append(sub_jacobians['constraint_jacobian'].detach().numpy())
+                    reg_jacobian_list.append(sub_jacobians['reg_jacobian'].detach().numpy())
                 except Exception as e:
                     print(f"Error processing batch: {e}")
+                
 
         # Check memory usage after processing
         if aux.check_memory_usage(threshold=ens_opt.mem_threshold):
@@ -107,8 +108,8 @@ if __name__ == '__main__':
     start = timer()  # Start timer
 
     # Set fit options and ensemble options
-    fit_opt = mod_libs.fit_options(lambda_v=0.01, w_threshold=0.3, T=8, iter_num=1000, checkpoint=100, mu_factor=0.1, loss_type='l2')
-    ens_opt = aux.ensemble_options(use_parallel=True, mem_threshold=0.8, batch_size=400, batch_num=20)
+    fit_opt = mod_libs.fit_options(lambda_v=0.01, w_threshold=0.3, T=7, iter_num=1000, checkpoint=500, mu_factor=0.1, loss_type='l2')
+    ens_opt = aux.ensemble_options(use_parallel=True, mem_threshold=0.8, batch_size=400, batch_num=50, continuum= True)
 
     # Run directed acyclic graph learning
     W_est_list, loss_jacobian_list, score_jacobian_list, constraint_jacobian_list, reg_jacobian_list = directed_acyclic_graph_learning(X_tensor, fit_opt, ens_opt)
@@ -128,12 +129,26 @@ if __name__ == '__main__':
         consistency_metrics_spearman = eva.causal_structure_consistency(W_true, W_est != 0, method='spearman')
         print(f"Causal Structure Consistency (Spearman) for W_est[{idx}]: {consistency_metrics_spearman}")
     
-    expectation_W = aux.compute_expectation(W_est_list, use_masked_expectation=True)
+    expectation_W = aux.frequency_summary(W_est_list)
 
     acc = eva.causal_structure_accuracy(B_true, expectation_W != 0)  # Calculate accuracy
     print(f"Accuracy for expectation_W with masked_expectation: {acc}")
 
-    for con_l in [0.99,0.95,0.9,0.8,0.7,0.6,0.5]:
-        expectation_W2 = aux.conformal_inference(W_est_list, confidence_level=con_l)
-        acc = eva.causal_structure_accuracy(B_true, expectation_W2 != 0)  # Calculate accuracy
+    for con_l in [0.95,0.9,0.8,0.7]:
+        expectation_W, confidence_intervals = aux.conformal_inference(W_est_list, confidence_level=con_l)
+        non_zero_indices = np.where(expectation_W !=0)[0]
+        print(f"Confidence intervals of edge weights with confidence_level={con_l}:")
+        print(confidence_intervals[non_zero_indices])
+
+        acc = eva.causal_structure_accuracy(B_true, expectation_W != 0)  # Calculate accuracy
         print(f"Accuracy for expectation_W using conformal_inference with confidence_level={con_l}: {acc}")
+        
+        p_values, causal_effect_intervals = aux.causal_effects_with_significance(loss_jacobian_list, expectation_W, confidence_level=con_l)
+        print(f"Causal effect intervals associated with loss_jacobian_list and confidence_level={con_l}:")
+        print(causal_effect_intervals[non_zero_indices])
+        print(np.sum(p_values[non_zero_indices]<0.05)/len(non_zero_indices))
+
+        p_values, causal_effect_intervals = aux.causal_effects_with_significance(score_jacobian_list, expectation_W, confidence_level=con_l)
+        print(f"Causal effect intervals associated with score_jacobian_list and confidence_level={con_l}:")
+        print(causal_effect_intervals[non_zero_indices])
+        print(np.sum(p_values[non_zero_indices]<0.05)/len(non_zero_indices))
