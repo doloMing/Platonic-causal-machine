@@ -2,7 +2,8 @@ import numpy as np
 import igraph as ig
 import random
 import torch
-import psutil  
+import psutil
+from scipy.stats import mannwhitneyu
 
 def set_random_seed(seed: int):
     random.seed(seed)
@@ -110,7 +111,7 @@ class ensemble_options:
         self.batch_num = batch_num  # Store the number of batches
         self.continuum = continuum  # Store whether to use contiguous samples
 
-def compute_expectation(all_sub_matrices, use_masked_expectation=False):
+def frequency_summary(all_sub_matrices):
     """
     Compute the expectation of matrices in all_sub_matrices.
     
@@ -134,37 +135,35 @@ def compute_expectation(all_sub_matrices, use_masked_expectation=False):
     # Divide by the number of matrices to get the average
     expectation_matrix /= len(all_sub_matrices)
     
-    if use_masked_expectation:
-        # Find the minimum percentage threshold n that ensures the expectation_matrix is a DAG
-        n = 50  # Start with 50%
-        found_dag = True
+    # Find the minimum percentage threshold n that ensures the expectation_matrix is a DAG
+    n = 50  # Start with 50%
+    found_dag = True
 
-        mask = np.zeros_like(all_sub_matrices[0], dtype=int)
-        for matrix in all_sub_matrices:
-            mask += (matrix != 0).astype(int)  # Increment mask where matrix is non-zero
+    mask = np.zeros_like(all_sub_matrices[0], dtype=int)
+    for matrix in all_sub_matrices:
+        mask += (matrix != 0).astype(int)  # Increment mask where matrix is non-zero
+    
+    while n > 0 and found_dag:
+        # Set sel_mask entries to 1 if they exceed n% of the number of matrices
+        threshold_count = (len(all_sub_matrices) * n) / 100
+        sel_mask = (mask > threshold_count).astype(int)
         
-        while n > 0 and found_dag:
-            # Set sel_mask entries to 1 if they exceed n% of the number of matrices
-            threshold_count = (len(all_sub_matrices) * n) / 100
-            sel_mask = (mask > threshold_count).astype(int)
-            
-            # Apply the mask to the expectation matrix
-            masked_expectation_matrix = expectation_matrix * sel_mask
-            
-            # Check if the masked expectation matrix is a DAG
-            found_dag = is_dag(masked_expectation_matrix != 0)
-            n -= 1
+        # Apply the mask to the expectation matrix
+        masked_expectation_matrix = expectation_matrix * sel_mask
+        
+        # Check if the masked expectation matrix is a DAG
+        found_dag = is_dag(masked_expectation_matrix != 0)
+        n -= 1
 
-            if n <= 0:
-                raise ValueError("No valid percentage found that results in a DAG.")
+        if n <= 0:
+            raise ValueError("No valid percentage found that results in a DAG.")
 
-        optimal_n = n + 2
-        threshold_count = (len(all_sub_matrices) * optimal_n) / 100
-        optimal_mask = (mask > threshold_count).astype(int)
-        expectation_matrix *= optimal_mask
+    optimal_n = n + 2
+    threshold_count = (len(all_sub_matrices) * optimal_n) / 100
+    optimal_mask = (mask > threshold_count).astype(int)
+    expectation_matrix *= optimal_mask
 
     return expectation_matrix
-
 
 
 def conformal_inference(adjacency_matrices, confidence_level=0.95):
@@ -177,10 +176,12 @@ def conformal_inference(adjacency_matrices, confidence_level=0.95):
     
     Returns:
     - aggregated_matrix (np.ndarray): The aggregated weighted adjacency matrix of shape (d, d).
+    - confidence_intervals (np.ndarray): A array of shape (d, d, 2), where each (i, j, :) is the confidence interval of edge (i, j) in the aggregated DAG. 
     """
-    # Get the dimensions
-    k = len(adjacency_matrices)  # Number of bootstrap samples
-    d = adjacency_matrices[0].shape[0]
+
+    # Convert list of adjacency matrices to a NumPy array
+    adjacency_matrices = np.array(adjacency_matrices)
+    _, d, _ = adjacency_matrices.shape
 
     # Calculate the median value for each edge across the bootstrap samples
     median_matrix = np.median(adjacency_matrices, axis=0)
@@ -193,21 +194,69 @@ def conformal_inference(adjacency_matrices, confidence_level=0.95):
 
     # Construct the aggregated matrix: only edges with deviations below the threshold are retained
     aggregated_matrix = np.zeros((d, d))
+    confidence_intervals = np.zeros((d, d, 2))  # To store lower and upper bounds for each edge
     for i in range(d):
         for j in range(d):
             if np.mean(deviations[:, i, j] <= deviation_thresholds[i, j]) >= confidence_level:
                 aggregated_matrix[i, j] = median_matrix[i, j]
+                # Calculate confidence interval for edge (i, j)
+                lower_bound = np.percentile(adjacency_matrices[:, i, j], (1 - confidence_level) / 2 * 100)
+                upper_bound = np.percentile(adjacency_matrices[:, i, j], (1 + confidence_level) / 2 * 100)
+                confidence_intervals[i, j] = [lower_bound, upper_bound]
     
-    return aggregated_matrix
+    return aggregated_matrix, confidence_intervals
 
-if __name__ == '__main__':
-    k = 100  # Number of bootstrap samples
-    d = 5    # Number of variables
-    # Generate sample adjacency matrices as bootstrap examples
-    adjacency_matrices = [np.random.rand(d, d) for _ in range(k)]
 
-    # Compute conformal inference-based summary matrix
-    final_matrix = conformal_inference(adjacency_matrices, confidence_level=0.99)
 
-    print("Aggregated adjacency matrix:")
-    print(final_matrix)
+def causal_effects_with_significance(jacobians, summary_dag, confidence_level=0.95):
+    """
+    Estimate causal effect p-values to determine statistical significance of each directed edge.
+    
+    Parameters:
+    - jacobians (list of np.ndarray): A list with k elements, each being a d*d Jacobian matrix.
+    - summary_dag (np.ndarray): A d*d weighted adjacency matrix indicating significant causal relations.
+    - confidence_level (float): The confidence level for statistical significance.
+    
+    Returns:
+    - p_values (np.ndarray): A d*d matrix containing p-values for each directed edge in the summary DAG.
+    - causal_effect_intervals (np.ndarray): A d*d*2 array containing the lower and upper bounds of causal effects for each directed edge.
+    """
+    # Convert jacobians list to a 3D NumPy array of shape (k, d, d)
+    jacobians = np.abs(np.array(jacobians))
+    _, d, _ = jacobians.shape
+    
+    # Initialize p-values matrix with 1 (non-significant by default)
+    p_values = np.ones((d, d))  
+    causal_effect_intervals = np.zeros((d, d, 2))  # Array to store both lower and upper bounds for each edge
+
+    # Get the indices of non-zero elements in summary_dag
+    non_zero_indices = np.nonzero(summary_dag)
+
+    # Iterate through each non-zero directed edge (i, j) in the summary DAG
+    for idx in range(len(non_zero_indices[0])):
+        i, j = non_zero_indices[0][idx], non_zero_indices[1][idx]
+        
+        # Collect Jacobian values for edge (i, j) across bootstrap samples
+        A_values = jacobians[:, i, j] 
+        
+        # Collect Jacobian values for non-existing edges (m, j) in the summary DAG
+        zero_indices_for_j = np.where(summary_dag[:, j] == 0)[0]
+        B_values = []
+        for m in zero_indices_for_j:
+            B_values.extend(jacobians[:, m, j]) # Add all bootstrap samples for (m, j)
+        
+        # B_values = jacobians[:, j, j] 
+
+        # if B_values:  # Only perform the test if there are non-existing edges pointing to j
+        #     # Perform Mann-Whitney U test between A_values and B_values
+        _, p_value = mannwhitneyu(A_values, B_values, alternative='greater')
+        p_values[i, j] = p_value
+        
+        # Calculate the confidence interval for the causal effect
+        lower_bound = np.percentile(A_values, (1 - confidence_level) / 2 * 100)
+        upper_bound = np.percentile(A_values, (1 + confidence_level) / 2 * 100)
+        causal_effect_intervals[i, j, 0] = lower_bound
+        causal_effect_intervals[i, j, 1] = upper_bound
+
+    return p_values, causal_effect_intervals
+
